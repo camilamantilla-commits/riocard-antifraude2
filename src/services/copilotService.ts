@@ -1,4 +1,5 @@
 import { decideCopilotAction, interpretIntent } from '@/services/decisionEngine';
+import { findFaqAnswer } from '@/services/copilotFaqService';
 import { isValidCardFormat, lookupCard, maskCardId, normalizeCardInput } from '@/services/cardLookupService';
 import type {
   CardFailure,
@@ -11,7 +12,7 @@ import type {
   CopilotTurnParams,
   CopilotTurnResult,
 } from '@/types/copilot';
-import type { TransactionRecord, UploadedDataset } from '@/types/fraud';
+import type { FraudAlert, TransactionRecord, UploadedDataset } from '@/types/fraud';
 
 function createMessage(
   channel: CopilotChannel,
@@ -34,6 +35,12 @@ function createMessage(
 function formatDateTime(dateTime: string) {
   return new Intl.DateTimeFormat('pt-BR', {
     dateStyle: 'short',
+    timeStyle: 'short',
+  }).format(new Date(dateTime));
+}
+
+function formatTime(dateTime: string) {
+  return new Intl.DateTimeFormat('pt-BR', {
     timeStyle: 'short',
   }).format(new Date(dateTime));
 }
@@ -83,8 +90,9 @@ function initialPrompt(channel: CopilotChannel) {
   return createMessage(
     channel,
     'assistant',
-    `Oi! Eu sou o Copilot de Atendimento Riocard no canal ${channelLabel}. Para iniciar o atendimento, por favor informe seu nome completo.`,
+    `Oi! Eu sou o Copilot de Atendimento Riocard no canal ${channelLabel}. Posso ajudar com bloqueio, recarga, uso do cartao, segunda via e outras duvidas. Pode me perguntar do seu jeito ou escolher um dos temas abaixo para eu te ajudar mais rapido. Se quiser iniciar um atendimento completo, por favor informe seu nome completo.`,
     'info',
+    ['Meu cartao foi bloqueado', 'Nao reconheco uma transacao', 'Fiz recarga e nao entrou', 'Como pedir segunda via'],
   );
 }
 
@@ -111,6 +119,69 @@ export function createInitialMessages(channel: CopilotChannel) {
   return [initialPrompt(channel)];
 }
 
+function normalizeForValidation(value: string) {
+  return value
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase();
+}
+
+function buildValidationReminder(channel: CopilotChannel, field: NonNullable<CopilotSessionState['awaitingField']>) {
+  if (field === 'full_name') {
+    return createMessage(
+      channel,
+      'assistant',
+      'Antes de analisar o seu caso, preciso confirmar sua identificacao. Por favor, informe seu nome completo.',
+      'warning',
+    );
+  }
+
+  if (field === 'cpf') {
+    return createMessage(
+      channel,
+      'assistant',
+      'Para seguir com a validacao do atendimento, preciso do seu CPF. Envie os 11 digitos ou o CPF formatado.',
+      'warning',
+    );
+  }
+
+  if (field === 'address') {
+    return createMessage(
+      channel,
+      'assistant',
+      'Agora preciso confirmar seu endereco atual para concluir a validacao do usuario antes de consultar o cartao.',
+      'warning',
+    );
+  }
+
+  return createMessage(
+    channel,
+    'assistant',
+    'Para eu analisar o que esta acontecendo, preciso primeiro localizar o seu cartao. Informe o numero do cartao exatamente como ele aparece no cadastro.',
+    'warning',
+  );
+}
+
+function isLikelyFullName(value: string) {
+  const normalized = normalizeForValidation(value);
+  const words = normalized.split(/\s+/).filter(Boolean);
+  const invalidKeywords = ['cartao', 'bloqueado', 'transacao', 'recarga', 'reembolso', 'segunda via', 'fraude', 'saldo', 'nao reconheco'];
+
+  if (/\d/.test(value)) {
+    return false;
+  }
+
+  if (words.length < 2 || words.length > 5) {
+    return false;
+  }
+
+  return !invalidKeywords.some((keyword) => normalized.includes(keyword));
+}
+
+function looksLikeIssueDescription(value: string) {
+  return interpretIntent(value) !== 'unknown' || Boolean(findFaqAnswer(value)) || value.includes('?');
+}
+
 function normalizeCpf(value: string) {
   return value.replace(/\D/g, '');
 }
@@ -132,8 +203,282 @@ function buildCustomerConfirmation(channel: CopilotChannel, session: CopilotSess
   return createMessage(
     channel,
     'assistant',
-    `Obrigada. Confirmei os dados iniciais:\n\nNome: ${session.customer.fullName}\nCPF: ${session.customer.cpf}\nEndereco: ${session.customer.address}\n\nAgora informe o numero do cartao para eu consultar a base carregada.`,
+    `Obrigada. Confirmei os dados iniciais:\n\nNome: ${session.customer.fullName}\nCPF: ${session.customer.cpf}\nEndereco: ${session.customer.address}\n\nAgora informe o numero do cartao para eu localizar o cadastro e analisar o que esta acontecendo.`,
     'info',
+  );
+}
+
+function buildLookupContextMessage(lookup: CardLookupResult) {
+  const latestValidation = lookup.summary.lastValidation
+    ? `${formatDateTime(lookup.summary.lastValidation)} em ${lookup.summary.lastLocation}`
+    : 'sem validacao recente';
+
+  const statusText =
+    lookup.summary.status === 'bloqueado'
+      ? 'O cartao esta com restricao de uso no momento.'
+      : lookup.summary.status === 'atencao'
+        ? 'O cartao esta em observacao, com sinais que merecem acompanhamento.'
+        : 'O cartao esta ativo neste momento.';
+
+  const alertText = lookup.alerts.length
+    ? `Identifiquei ${lookup.alerts.length} alerta${lookup.alerts.length === 1 ? '' : 's'} recente${lookup.alerts.length === 1 ? '' : 's'} para esse cartao.`
+    : 'Nao identifiquei alertas relevantes neste momento.';
+
+  return `${statusText}\nUltima validacao: ${latestValidation}\n${alertText}`;
+}
+
+function isAskingWhyBlockedOrObserved(input: string, lookup: CardLookupResult) {
+  const normalized = normalizeText(input);
+  const asksReason =
+    normalized.includes('por que') ||
+    normalized.includes('porque') ||
+    normalized.includes('motivo') ||
+    normalized.includes('razao') ||
+    normalized.includes('o que aconteceu') ||
+    normalized.includes('qual atividade') ||
+    normalized.includes('atividade suspeita') ||
+    normalized.includes('justificativa');
+  const mentionsStatus =
+    normalized.includes('bloque') ||
+    normalized.includes('observa') ||
+    normalized.includes('restricao') ||
+    normalized.includes('suspeit');
+  const cardNeedsExplanation = lookup.summary.status !== 'ativo' || lookup.alerts.length > 0;
+
+  return asksReason && (mentionsStatus || cardNeedsExplanation);
+}
+
+function getAlertTransactions(alert: FraudAlert, lookup: CardLookupResult) {
+  const relatedIds = new Set([alert.transactionId, ...alert.relatedTransactionIds]);
+
+  return lookup.transactions
+    .filter((transaction) => relatedIds.has(transaction.id))
+    .sort((left, right) => left.timestamp - right.timestamp);
+}
+
+function formatMinutesDifference(first: TransactionRecord, second: TransactionRecord) {
+  const diffMinutes = Math.max(1, Math.round(Math.abs(second.timestamp - first.timestamp) / 60000));
+  return `${diffMinutes} minuto${diffMinutes === 1 ? '' : 's'}`;
+}
+
+function getTransactionAnchor(alert: FraudAlert, lookup: CardLookupResult) {
+  return (
+    lookup.transactions.find((transaction) => transaction.id === alert.transactionId) ??
+    lookup.transactions.find((transaction) => transaction.externalTransactionId === alert.externalTransactionId) ??
+    null
+  );
+}
+
+function findNearestContextTransaction(
+  lookup: CardLookupResult,
+  anchor: TransactionRecord,
+  options?: {
+    requireDifferentLocation?: boolean;
+    sameDayOnly?: boolean;
+    maxMinutes?: number;
+    sameLocationPreferred?: boolean;
+  },
+) {
+  const candidates = lookup.transactions.filter((transaction) => {
+    if (transaction.id === anchor.id) {
+      return false;
+    }
+
+    if (options?.sameDayOnly && transaction.dateTime.slice(0, 10) !== anchor.dateTime.slice(0, 10)) {
+      return false;
+    }
+
+    if (options?.requireDifferentLocation && transaction.locationLabel === anchor.locationLabel) {
+      return false;
+    }
+
+    const diffMinutes = Math.abs(transaction.timestamp - anchor.timestamp) / 60000;
+    if (options?.maxMinutes && diffMinutes > options.maxMinutes) {
+      return false;
+    }
+
+    return true;
+  });
+
+  return candidates.sort((left, right) => {
+    const diffLeft = Math.abs(left.timestamp - anchor.timestamp);
+    const diffRight = Math.abs(right.timestamp - anchor.timestamp);
+
+    if (options?.sameLocationPreferred) {
+      const leftSameLocation = left.locationLabel === anchor.locationLabel ? 0 : 1;
+      const rightSameLocation = right.locationLabel === anchor.locationLabel ? 0 : 1;
+      if (leftSameLocation !== rightSameLocation) {
+        return leftSameLocation - rightSameLocation;
+      }
+    }
+
+    return diffLeft - diffRight;
+  })[0] ?? null;
+}
+
+function getTransactionsForNarrative(alert: FraudAlert, lookup: CardLookupResult) {
+  const relatedTransactions = getAlertTransactions(alert, lookup);
+  if (relatedTransactions.length >= 2) {
+    return relatedTransactions;
+  }
+
+  const anchor = relatedTransactions[0] ?? getTransactionAnchor(alert, lookup);
+  if (!anchor) {
+    return relatedTransactions;
+  }
+
+  if (alert.fraudType === 'deslocamento impossivel' || alert.fraudType === 'compartilhamento') {
+    const companion = findNearestContextTransaction(lookup, anchor, {
+      requireDifferentLocation: true,
+      maxMinutes: 180,
+    });
+
+    return companion ? [anchor, companion].sort((left, right) => left.timestamp - right.timestamp) : [anchor];
+  }
+
+  if (alert.fraudType === 'revenda' || alert.fraudType === 'multi validacao sequencial') {
+    const timeWindow = lookup.transactions
+      .filter((transaction) => {
+        const diffMinutes = Math.abs(transaction.timestamp - anchor.timestamp) / 60000;
+        return diffMinutes <= 10 && transaction.locationLabel === anchor.locationLabel;
+      })
+      .sort((left, right) => left.timestamp - right.timestamp);
+
+    return timeWindow.length > 1 ? timeWindow : [anchor];
+  }
+
+  if (alert.fraudType === 'uso abusivo' || alert.fraudType === 'uso gratuidade indevida') {
+    const sameDayTransactions = lookup.transactions
+      .filter((transaction) => transaction.dateTime.slice(0, 10) === anchor.dateTime.slice(0, 10))
+      .sort((left, right) => left.timestamp - right.timestamp);
+
+    return sameDayTransactions.length > 1 ? sameDayTransactions : [anchor];
+  }
+
+  const closestTransaction = findNearestContextTransaction(lookup, anchor, { maxMinutes: 240 });
+  return closestTransaction ? [anchor, closestTransaction].sort((left, right) => left.timestamp - right.timestamp) : [anchor];
+}
+
+function formatTransactionMoment(transaction: TransactionRecord) {
+  return `${transaction.locationLabel} as ${formatTime(transaction.dateTime)} de ${new Intl.DateTimeFormat('pt-BR', {
+    dateStyle: 'short',
+  }).format(new Date(transaction.dateTime))}`;
+}
+
+function buildAlertReasonNarrative(alert: FraudAlert, lookup: CardLookupResult) {
+  const transactions = getTransactionsForNarrative(alert, lookup);
+  const first = transactions[0];
+  const second = transactions[1];
+
+  if (alert.fraudType === 'deslocamento impossivel' && first && second) {
+    const minutes = formatMinutesDifference(first, second);
+    return `Houve um uso em ${formatTransactionMoment(first)} e outro em ${formatTransactionMoment(
+      second,
+    )}, com diferenca de ${minutes}, o que e considerado um deslocamento impossivel para o mesmo cartao.`;
+  }
+
+  if (alert.fraudType === 'compartilhamento' && first && second) {
+    const minutes = formatMinutesDifference(first, second);
+    return `Identificamos utilizacoes muito proximas entre si: uma em ${formatTransactionMoment(
+      first,
+    )} e outra em ${formatTransactionMoment(
+      second,
+    )}, com diferenca de ${minutes}. Esse padrao sugere que o cartao pode ter sido usado por mais de uma pessoa.`;
+  }
+
+  if ((alert.fraudType === 'revenda' || alert.fraudType === 'multi validacao sequencial') && transactions.length > 0) {
+    const firstTransaction = transactions[0];
+    const lastTransaction = transactions.at(-1) ?? firstTransaction;
+    const mainLocation = firstTransaction.locationLabel;
+
+    return `Foram registradas ${transactions.length} utilizacoes em sequencia entre ${formatTime(
+      firstTransaction.dateTime,
+    )} e ${formatTime(lastTransaction.dateTime)}${mainLocation ? ` em ${mainLocation}` : ''}, em um ritmo acima do esperado para uso individual.`;
+  }
+
+  if (alert.fraudType === 'uso abusivo' && transactions.length > 0) {
+    const usageDate = new Intl.DateTimeFormat('pt-BR', { dateStyle: 'short' }).format(new Date(transactions[0].dateTime));
+    return `O cartao apresentou um volume de uso acima do padrao esperado no dia ${usageDate}, com ${transactions.length} validacoes relacionadas ao alerta.`;
+  }
+
+  if (alert.fraudType === 'uso gratuidade indevida' && transactions.length > 0) {
+    const firstLocation = transactions[0]?.locationLabel;
+    return `Foi identificado um padrao de uso incompativel com o beneficio do cartao, com recorrencia acima do esperado${firstLocation ? ` em ${firstLocation}` : ''}.`;
+  }
+
+  if (alert.fraudType === 'clonagem de cartao' && first) {
+    return `Detectamos um comportamento incompativel com o uso habitual do cartao, com indicios de uso indevido a partir de ${formatTransactionMoment(
+      first,
+    )}.`;
+  }
+
+  if (first && second) {
+    const minutes = formatMinutesDifference(first, second);
+    return `Foi identificado um comportamento suspeito com uso em ${formatTransactionMoment(first)} e novo registro em ${formatTransactionMoment(
+      second,
+    )}, com diferenca de ${minutes}, fora do padrao esperado para o cartao.`;
+  }
+
+  if (first) {
+    return `Foi identificado um comportamento suspeito a partir do uso registrado em ${formatTransactionMoment(
+      first,
+    )}, fora do padrao esperado para esse cartao.`;
+  }
+
+  return 'Foi identificado um comportamento suspeito fora do padrao esperado para esse cartao.';
+}
+
+function buildStatusExplanationMessage(channel: CopilotChannel, lookup: CardLookupResult) {
+  const topAlert = [...lookup.alerts].sort((left, right) => right.riskPoints - left.riskPoints || right.timestamp - left.timestamp)[0];
+  const intro =
+    lookup.summary.status === 'bloqueado'
+      ? 'Seu cartao foi bloqueado por seguranca porque identificamos uma atividade suspeita.'
+      : lookup.summary.status === 'atencao'
+        ? 'Seu cartao esta em observacao porque identificamos uma atividade fora do padrao.'
+        : 'Analisei o historico recente do seu cartao e encontrei o seguinte contexto.';
+
+  const explanation = topAlert
+    ? buildAlertReasonNarrative(topAlert, lookup)
+    : lookup.summary.statusReason || 'No momento nao encontrei um alerta detalhado alem do status operacional do cartao.';
+
+  const closing =
+    lookup.summary.status === 'bloqueado'
+      ? 'Por seguranca, o uso foi restringido preventivamente ate a conclusao da analise.'
+      : lookup.summary.status === 'atencao'
+        ? 'Por enquanto o cartao segue em observacao, e novas utilizacoes fora do padrao podem gerar restricao preventiva.'
+        : 'Se quiser, tambem posso explicar as ultimas utilizacoes registradas.';
+
+  return createMessage(
+    channel,
+    'assistant',
+    `${intro}\n\n${explanation}\n\n${closing}`,
+    lookup.summary.status === 'bloqueado' ? 'danger' : 'warning',
+    lookup.summary.status === 'bloqueado'
+      ? ['Quero entender as ultimas transacoes', 'Quero segunda via', 'Falar com atendente']
+      : ['Quero entender as ultimas transacoes', 'Consultar uso', 'Falar com atendente'],
+  );
+}
+
+function buildContextualFaqMessage(channel: CopilotChannel, input: string, lookup: CardLookupResult) {
+  const faqMatch = findFaqAnswer(input);
+
+  if (!faqMatch) {
+    return null;
+  }
+
+  const lead =
+    faqMatch.confidence >= 0.72
+      ? 'Analisei o seu cartao e a sua pergunta esta muito proxima de um caso que ja tratamos nesse tipo de atendimento.'
+      : 'Analisei o seu cartao e encontrei uma orientacao de atendimento parecida com a sua situacao.';
+
+  return createMessage(
+    channel,
+    'assistant',
+    `${lead}\n\n${buildLookupContextMessage(lookup)}\n\nOrientacao para o seu caso:\n${faqMatch.resposta}\n\nCanal recomendado: ${faqMatch.canalSugerido}`,
+    lookup.summary.status === 'bloqueado' || faqMatch.prioridade === 'Alta' ? 'warning' : 'info',
+    faqMatch.suggestions.length
+      ? faqMatch.suggestions
+      : ['Bilhete nao funcionou', 'Quero reembolso', 'Consultar uso', 'Suspeita de fraude'],
   );
 }
 
@@ -168,7 +513,7 @@ function explainAlertForCustomer(lookup: CardLookupResult) {
     return 'Foi identificado um padrao de uso que pode indicar utilizacao indevida do beneficio do cartao.';
   }
 
-  return topAlert.reason;
+  return 'Foi identificado um comportamento fora do padrao esperado para esse cartao.';
 }
 
 function explainAlertsForCustomer(lookup: CardLookupResult) {
@@ -197,7 +542,7 @@ function explainAlertsForCustomer(lookup: CardLookupResult) {
       return 'Foi visto um padrao de uso que pode indicar uso indevido do beneficio.';
     }
 
-    return alert.reason;
+    return 'Foi identificado um comportamento fora do padrao esperado para esse cartao.';
   });
 }
 
@@ -214,7 +559,7 @@ function getRecentTransactions(lookup: CardLookupResult) {
 
 function parseTransactionSelection(input: string, lookup: CardLookupResult) {
   const normalized = normalizeText(input);
-  const match = normalized.match(/transa(?:c|ç)(?:a|ã)o\s*(\d+)/i) ?? normalized.match(/^(\d)$/);
+  const match = normalized.match(/transacao\s*(\d+)/i) ?? normalized.match(/^(\d)$/);
 
   if (!match) {
     return null;
@@ -429,7 +774,18 @@ function handleRefundTargetReply(channel: CopilotChannel, lookup: CardLookupResu
   };
 }
 
-function answerResolvedIntent(channel: CopilotChannel, intent: CopilotIntent, lookup: CardLookupResult) {
+function answerResolvedIntent(channel: CopilotChannel, intent: CopilotIntent, lookup: CardLookupResult, input: string) {
+  if (isAskingWhyBlockedOrObserved(input, lookup)) {
+    return {
+      messages: [buildStatusExplanationMessage(channel, lookup)],
+      awaitingField: null,
+      route: 'automatico' as const,
+      handoffRecommended: lookup.summary.status === 'bloqueado',
+    };
+  }
+
+  const contextualFaqMessage = buildContextualFaqMessage(channel, input, lookup);
+
   if (intent === 'usage_history') {
     return {
       messages: [buildUsageHistoryMessage(channel, lookup)],
@@ -444,6 +800,7 @@ function answerResolvedIntent(channel: CopilotChannel, intent: CopilotIntent, lo
 
     return {
       messages: [
+        ...(contextualFaqMessage ? [contextualFaqMessage] : []),
         createMessage(
           channel,
           'assistant',
@@ -466,6 +823,7 @@ function answerResolvedIntent(channel: CopilotChannel, intent: CopilotIntent, lo
     if (lookup.failures.length > 1) {
       return {
         messages: [
+          ...(contextualFaqMessage ? [contextualFaqMessage] : []),
           createMessage(
             channel,
             'assistant',
@@ -481,7 +839,9 @@ function answerResolvedIntent(channel: CopilotChannel, intent: CopilotIntent, lo
     }
 
     return {
-      messages: resolveRefund(channel, lookup, lookup.failures[0] ?? null),
+      messages: contextualFaqMessage
+        ? [...[contextualFaqMessage], ...resolveRefund(channel, lookup, lookup.failures[0] ?? null)]
+        : resolveRefund(channel, lookup, lookup.failures[0] ?? null),
       awaitingField: null,
       route: 'automatico' as const,
       handoffRecommended: false,
@@ -490,7 +850,7 @@ function answerResolvedIntent(channel: CopilotChannel, intent: CopilotIntent, lo
 
   if (intent === 'fraud_suspicion') {
     return {
-      messages: [buildFraudMessage(channel, lookup)],
+      messages: contextualFaqMessage ? [contextualFaqMessage, buildFraudMessage(channel, lookup)] : [buildFraudMessage(channel, lookup)],
       awaitingField: null,
       route: 'automatico' as const,
       handoffRecommended: false,
@@ -499,15 +859,17 @@ function answerResolvedIntent(channel: CopilotChannel, intent: CopilotIntent, lo
 
   if (intent === 'faq') {
     return {
-      messages: [
-        createMessage(
-          channel,
-          'assistant',
-          'Posso ajudar com falha de bilhete, reembolso, consulta de uso e suspeita de fraude. Vou sempre explicar o motivo de forma simples, sem termos tecnicos, para voce entender o que aconteceu.',
-          'info',
-          ['Bilhete nao funcionou', 'Quero reembolso', 'Consultar uso', 'Suspeita de fraude'],
-        ),
-      ],
+      messages: contextualFaqMessage
+        ? [contextualFaqMessage]
+        : [
+            createMessage(
+              channel,
+              'assistant',
+              'Posso ajudar com falha de bilhete, reembolso, consulta de uso e suspeita de fraude. Vou sempre explicar o motivo de forma simples, sem termos tecnicos, para voce entender o que aconteceu.',
+              'info',
+              ['Bilhete nao funcionou', 'Quero reembolso', 'Consultar uso', 'Suspeita de fraude'],
+            ),
+          ],
       awaitingField: null,
       route: 'automatico' as const,
       handoffRecommended: false,
@@ -557,6 +919,13 @@ export function handleCopilotTurn({ channel, input, session, dataset }: CopilotT
   }
 
   if (session.awaitingField === 'full_name') {
+    if (!isLikelyFullName(trimmed) && looksLikeIssueDescription(trimmed)) {
+      return {
+        session,
+        messages: [buildValidationReminder(channel, 'full_name')],
+      };
+    }
+
     return {
       session: {
         ...session,
@@ -579,6 +948,13 @@ export function handleCopilotTurn({ channel, input, session, dataset }: CopilotT
   }
 
   if (session.awaitingField === 'cpf') {
+    if (!isValidCpf(trimmed) && looksLikeIssueDescription(trimmed)) {
+      return {
+        session,
+        messages: [buildValidationReminder(channel, 'cpf')],
+      };
+    }
+
     if (!isValidCpf(trimmed)) {
       return {
         session,
@@ -615,6 +991,13 @@ export function handleCopilotTurn({ channel, input, session, dataset }: CopilotT
   }
 
   if (session.awaitingField === 'address') {
+    if (looksLikeIssueDescription(trimmed)) {
+      return {
+        session,
+        messages: [buildValidationReminder(channel, 'address')],
+      };
+    }
+
     const nextSession = {
       ...session,
       customer: {
@@ -690,6 +1073,13 @@ export function handleCopilotTurn({ channel, input, session, dataset }: CopilotT
   }
 
   if (session.awaitingField === 'card_id' || !session.lookup) {
+    if (!isValidCardFormat(trimmed) && looksLikeIssueDescription(trimmed)) {
+      return {
+        session,
+        messages: [buildValidationReminder(channel, 'card_id')],
+      };
+    }
+
     const normalizedCardId = normalizeCardInput(trimmed);
     const directLookup = lookupCard(dataset, normalizedCardId);
 
@@ -716,7 +1106,7 @@ export function handleCopilotTurn({ channel, input, session, dataset }: CopilotT
           createMessage(
             channel,
             'assistant',
-            'Nao consegui identificar um numero de cartao valido na mensagem. Envie o numero exatamente como ele aparece no cadastro ou na base carregada.',
+            'Nao consegui identificar um numero de cartao valido na mensagem. Envie o numero exatamente como ele aparece no seu cadastro.',
             'warning',
           ),
         ],
@@ -732,7 +1122,7 @@ export function handleCopilotTurn({ channel, input, session, dataset }: CopilotT
           createMessage(
             channel,
             'assistant',
-            `Nao encontrei esse cartao na base atual. Confira o numero informado ou carregue uma planilha que contenha esse cadastro.`,
+            'Nao encontrei esse cartao em nossos registros atuais. Confira o numero informado e tente novamente.',
             'warning',
             ['Tentar novamente', 'Falar com atendente'],
           ),
@@ -791,6 +1181,20 @@ export function handleCopilotTurn({ channel, input, session, dataset }: CopilotT
     }
   }
 
+  if (session.lookup && isAskingWhyBlockedOrObserved(trimmed, session.lookup)) {
+    return {
+      session: {
+        ...session,
+        awaitingField: null,
+        pendingIntent: null,
+        handoffRecommended: session.lookup.summary.status === 'bloqueado',
+        lastIntent: interpretIntent(trimmed),
+        lastRoute: 'automatico',
+      },
+      messages: [buildStatusExplanationMessage(channel, session.lookup)],
+    };
+  }
+
   const intent = interpretIntent(trimmed);
   const decision = decideCopilotAction({
     intent,
@@ -818,6 +1222,22 @@ export function handleCopilotTurn({ channel, input, session, dataset }: CopilotT
   }
 
   if (decision === 'ask_info') {
+    const contextualFaqMessage = buildContextualFaqMessage(channel, trimmed, session.lookup);
+
+    if (contextualFaqMessage) {
+      return {
+        session: {
+          ...session,
+          awaitingField: null,
+          pendingIntent: null,
+          handoffRecommended: false,
+          lastIntent: 'faq',
+          lastRoute: 'automatico',
+        },
+        messages: [contextualFaqMessage],
+      };
+    }
+
     const message =
       intent === 'refund'
         ? createMessage(
@@ -848,7 +1268,7 @@ export function handleCopilotTurn({ channel, input, session, dataset }: CopilotT
     };
   }
 
-  const resolution = answerResolvedIntent(channel, intent, session.lookup);
+  const resolution = answerResolvedIntent(channel, intent, session.lookup, trimmed);
 
   return {
     session: {

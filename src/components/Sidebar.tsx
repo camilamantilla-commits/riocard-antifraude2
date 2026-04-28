@@ -12,7 +12,7 @@ const navItems = [
   { to: '/vendas', label: 'Vendas Informais', icon: ScanSearch },
   { to: '/comportamento', label: 'Comportamento do Usuario', icon: BellDot },
   { to: '/acoes-risco', label: 'Acoes de Risco', icon: AlertTriangle },
-  { to: '/financeiro', label: 'Financeiro', icon: CircleDollarSign },
+  { to: '/financeiro', label: 'Financeiro & Previsao', icon: CircleDollarSign },
   { to: '/copilot', label: 'Copilot', icon: Bot },
 ];
 

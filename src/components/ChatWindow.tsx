@@ -24,7 +24,7 @@ export function ChatWindow({ messages, loading, onSuggestionClick }: ChatWindowP
         </div>
         <div>
           <h2 className="text-lg font-semibold text-panel">Conversa</h2>
-          <p className="text-sm text-slate-600">Atendimento em linguagem natural com historico visivel e respostas orientadas por regra.</p>
+          <p className="text-sm text-slate-600">Atendimento em linguagem natural com FAQ integrada, historico visivel e respostas orientadas por regra.</p>
         </div>
       </div>
 

@@ -121,7 +121,7 @@ export function CopilotPage() {
         <PageHeader
           eyebrow="Copilot"
           title="Copilot de Atendimento Riocard"
-          description="Um assistente conversacional para web e Telegram simulado, com consulta ao historico do cartao, analise de risco e encaminhamento inteligente para atendimento humano."
+          description="Um assistente conversacional para web e Telegram simulado, pronto para responder duvidas em linguagem natural e apoiar o atendimento quando necessario."
         />
       </div>
 

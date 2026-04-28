@@ -68,12 +68,23 @@ export function interpretIntent(input: string): CopilotIntent {
 export function decideCopilotAction({ intent, lookup, input }: CopilotDecisionContext): CopilotDecision {
   const normalizedInput = normalize(input);
   const explicitHuman = ['atendente', 'humano', 'especialista'].some((token) => normalizedInput.includes(token));
+  const asksReasonAboutStatus =
+    (normalizedInput.includes('por que') ||
+      normalizedInput.includes('porque') ||
+      normalizedInput.includes('motivo') ||
+      normalizedInput.includes('razao') ||
+      normalizedInput.includes('atividade suspeita')) &&
+    (normalizedInput.includes('bloque') || normalizedInput.includes('observa') || normalizedInput.includes('suspeit'));
   const multipleFailures = lookup.failures.length >= 2;
   const highRisk = lookup.summary.riskScore === 'alto';
   const blocked = lookup.summary.status === 'bloqueado';
 
   if (explicitHuman || intent === 'human_agent') {
     return 'handoff';
+  }
+
+  if (asksReasonAboutStatus && (blocked || lookup.summary.status === 'atencao' || lookup.alerts.length > 0)) {
+    return 'resolve';
   }
 
   if (intent === 'unknown') {
